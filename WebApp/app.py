@@ -7,7 +7,9 @@ from PySide6.QtCore import QFile, QIODevice, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 STREAM_URL = "http://192.168.254.123:81/stream"
-PORT_NAME = "/dev/rfcomm3"
+PORT_NAME = "COM4"
+# EDITOR'S NOTE: '/dev/rfcomm0' is a virtual port for Arjay's Nobara OS (Linux Fedora Distro)
+# For anyone testing this, please change this variable!
 
 class MyApp:
     def __init__(self, telemetrixObject):
