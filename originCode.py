@@ -109,7 +109,7 @@ class MyApp:
     def reset_to_neutralF(self):
         self.window.forwardSlider.setValue(49)
 
-
+                
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     conn_tele = MyTelemetrix(com_port=PORT_NAME)
