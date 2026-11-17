@@ -10,7 +10,7 @@ import urllib.request
 from PySide6.QtCore import QEvent, QFile, QIODevice, QObject, Qt, QUrl, Signal, QThread, QTimer
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton, QSlider, QStackedLayout, QWidget, QSizePolicy
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage, QPixmap, QIntValidator
 
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -20,7 +20,7 @@ except ImportError:
 from utils.myTelemetrix import MyTelemetrix
 
 PORT_NAME = "COM5"   # Change to your Bluetooth COM port; no connection is attempted at startup.
-STREAM_URL = "http://192.168.4.1:81/stream"
+STREAM_URL = "http://10.49.174.193:81/stream"
 SERVO_STEP = 5
 GRIP_CLOSED = 80
 GRIP_OPEN = 10
@@ -152,6 +152,12 @@ class RobotUI:
         self.grip.clicked.connect(self.toggle_grip)
         self.reconnect_button.clicked.connect(self.toggle_connection)
         self.port.returnPressed.connect(self.connect)
+        self.wheel_speed = self.get(QLineEdit, "wheelSpeedInput")
+        self.wheel_speed.setValidator(QIntValidator(0, 255, self.wheel_speed))
+        self.wheel_speed.setText(str(self.board.motor_speed))
+        self.wheel_speed.setPlaceholderText("0-255")
+        self.wheel_speed.editingFinished.connect(self.apply_speed)
+        self.wheel_speed.returnPressed.connect(self.wheel_speed.clearFocus)
         for name in ("upBtn", "downBtn", "leftBtn", "rightBtn"):
             button = self.get(QPushButton, name)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -319,6 +325,16 @@ class RobotUI:
             self.last_frame = None
             self.feed_placeholder.setPixmap(QPixmap())
             self.feed_placeholder.setText(self.placeholder_text)
+
+    def apply_speed(self):
+        try:
+            value = int(self.wheel_speed.text().strip())
+        except ValueError:
+            value = self.board.motor_speed  # Empty or invalid: keep the old speed.
+        value = max(0, min(255, value))
+        self.wheel_speed.setText(str(value))
+        self.board.set_motor_speed(value)
+        self.update_drive()  # Re-send so a speed change applies while driving.
 
     def show(self):
         self.window.show()

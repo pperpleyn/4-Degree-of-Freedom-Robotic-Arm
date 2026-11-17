@@ -7,9 +7,11 @@ import time
 from telemetrix import telemetrix
 
 IN1, IN2, IN3, IN4 = 2, 3, 7, 8
+EN1, EN2 = 5, 6
 PCA9685_ADDR = 0x40
 NEUTRAL = 49
 DEADZONE = 2
+MOTOR_SPEED = 140
 
 
 class MyTelemetrix:
@@ -19,6 +21,7 @@ class MyTelemetrix:
         self.last_error = ""
         self.servo_min_us = 500
         self.servo_max_us = 2400
+        self.motor_speed = MOTOR_SPEED
         if com_port is not None:
             self.reconn(com_port)
 
@@ -30,7 +33,8 @@ class MyTelemetrix:
         """Run on EVERY connection, including after a reconnect."""
         for pin in (IN1, IN2, IN3, IN4):
             self.board.set_pin_mode_digital_output(pin)
-
+        self.board.set_pin_mode_analog_output(EN1)
+        self.board.set_pin_mode_analog_output(EN2)
         self.board.set_pin_mode_i2c()
         time.sleep(0.1)
         # PCA9685: sleep -> 50 Hz prescale -> wake + auto-increment.
@@ -127,6 +131,13 @@ class MyTelemetrix:
         else:
             self.stop_motors()
 
+    def set_motor_speed(self, speed):
+        """Set the speed for both motors (0-255)."""
+        self.motor_speed = max(0, min(255, int(speed)))
+        if self.board is not None:
+            self.board.analog_write(EN1, self.motor_speed)
+            self.board.analog_write(EN2, self.motor_speed)
+
     def set_raw_motors(self, l_in1, l_in2, r_in1, r_in2):
         if self.board is None:
             return
@@ -134,6 +145,9 @@ class MyTelemetrix:
             (IN1, IN2, IN3, IN4), (l_in1, l_in2, r_in1, r_in2)
         ):
             self.board.digital_write(pin, int(value))
+
+        self.board.analog_write(EN1, self.motor_speed if (l_in1 or l_in2) else 0)
+        self.board.analog_write(EN2, self.motor_speed if (r_in1 or r_in2) else 0)
 
     def stop_motors(self):
         if self.board is None:
