@@ -10,16 +10,16 @@
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-//const char* ssid = "ESP32-Dih";
-//const char* password = "12345678";
+const char* ssid = "ESP32-Dih";
+const char* password = "12345678";
  
 // const char* ssid = "GFiber_2.4_Coverage_2bbc8";
 // const char* password = "72SMDP8g";
 
 // const int wifiSettings = 0; // Debugging Purposes!!!
 
-const char* ssid = "realme C65 90df";
-const char* password = "nswj8739";
+// const char* ssid = "realme C65 90df";
+// const char* password = "nswj8739";
 
 void startCameraServer();
 void setupLedFlash();
@@ -117,39 +117,39 @@ void setup() {
 
   // Added Code: This make the ESP32-Cam an Access Point, emitting a WiFi for device to connect.
 
-  // Serial.println("Creating AP IP....");
-  // WiFi.softAP(ssid, password);
+  Serial.println("Creating AP IP....");
+  WiFi.softAP(ssid, password);
 
-  // IPAddress IP = WiFi.softAPIP();
-  // Serial.print("AP IP Address: ");
-  // Serial.println(IP);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP Address: ");
+  Serial.println(IP);
 
-  // startCameraServer();
+  startCameraServer();
   
-  // Serial.print("Camera Ready! Use 'http://");
-  // Serial.print(IP);
-  // Serial.println("' to connect");
+  Serial.print("Camera Ready! Use 'http://");
+  Serial.print(IP);
+  Serial.println("' to connect");
   
   // ----- ----- ----- ----- ----- ----- ----- ----- ----- ----- ----- ----- ----- ----- ----- ----- 
 
-  Serial.println("Connecting to hardcoded SSID with hardcoded Password....");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
+  // Serial.println("Connecting to hardcoded SSID with hardcoded Password....");
+  // WiFi.mode(WIFI_STA);
+  // WiFi.begin(ssid, password);
+  // WiFi.setSleep(false);
 
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected");
+  // Serial.print("WiFi connecting");
+  // while (WiFi.status() != WL_CONNECTED) {
+  //   delay(500);
+  //   Serial.print(".");
+  // }
+  // Serial.println("");
+  // Serial.println("WiFi connected");
 
-  startCameraServer();
+  // startCameraServer();
 
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
+  // Serial.print("Camera Ready! Use 'http://");
+  // Serial.print(WiFi.localIP());
+  // Serial.println("' to connect");
   
     
 }

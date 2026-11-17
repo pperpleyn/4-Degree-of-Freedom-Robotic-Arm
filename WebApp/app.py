@@ -6,23 +6,24 @@ N/M pivot (servo 0); Space claw toggle (servo 3).
 import sys
 from pathlib import Path
 import urllib.request
+import time
+import threading
 
-from PySide6.QtCore import QEvent, QFile, QIODevice, QObject, Qt, QUrl, Signal, Slot, QThread, QTimer, QRunnable, QThreadPool, QRegularExpression
+from PySide6.QtCore import QEvent, QFile, QIODevice, QObject, Qt, QUrl, Signal, Slot, QThread, QTimer, QRunnable, QThreadPool
 from PySide6.QtUiTools import QUiLoader
-from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton, QSlider, QStackedLayout, QWidget, QSizePolicy
-from PySide6.QtGui import QImage, QPixmap, QIntValidator, QRegularExpressionValidator
-from zope import event
-
-try:
-    from PySide6.QtWebEngineWidgets import QWebEngineView
-except ImportError:
-    QWebEngineView = None
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton, QSlider, QStackedLayout, QWidget, QSizePolicy, QStyle, QStyleOptionSlider
+from PySide6.QtGui import QImage, QPixmap, QIntValidator
 
 from utils.myTelemetrix import MyTelemetrix
 
 PORT_NAME = "COM5"   # Change to your Bluetooth COM port; no connection is attempted at startup.
-STREAM_URL = "http://10.49.174.193:81/stream"
+STREAM_URL = "http://192.168.4.1:81/stream"  
+#http://10.49.174.193:81/stream
 SERVO_STEP = 5
+CONTROL_CENTER = 90
+SERVO_INTERVAL_MS = 50
+SERVO_DEGREES_PER_SECOND = 30
+CONTROL_DEADZONE = 3
 GRIP_CLOSED = 80
 GRIP_OPEN = 10
 NEUTRAL = 49
@@ -156,79 +157,84 @@ class KeyFilter(QObject):
         super().__init__(owner.window)
         self.owner = owner
         self.held = []
+        self.joint_held = []
+        self.mouse_channel = None
 
     def eventFilter(self, watched, event):
-        if watched is self.owner.window and event.type() == QEvent.Type.Close:
-            if not self.owner.close_ready:
-                event.ignore()
-                self.owner.shutdown()
-                return True
-        if watched is self.owner.window and event.type() == QEvent.Type.Resize:
-            self.owner.resize_layout()
-            return False
-        if self.owner.closing or self.owner.connection_busy:
-            return False
-        if not isinstance(watched, QWidget) or (watched is not self.owner.window and
-                not self.owner.window.isAncestorOf(watched)):
-            return False
+        owner = self.owner
         kind = event.type()
-        if kind == QEvent.Type.WindowDeactivate:
-            self.clear()
-            return False
+        if watched is owner.window:
+            if kind == QEvent.Type.Close and not owner.close_ready:
+                event.ignore()
+                owner.shutdown()
+                return True
+            if kind == QEvent.Type.Resize:
+                owner.resize_layout()
+                return False
+            if kind == QEvent.Type.WindowDeactivate:
+                self.clear()
+                return False
+        # Handle mouse input ourselves: no native groove auto-repeat/overshoot.
+        channel = next((c for c, s in owner.sliders.items() if watched is s), None)
+        if channel is not None:
+            if kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                if not owner.closing and not owner.connection_busy:
+                    self.mouse_channel = channel
+                    owner.mouse_control(channel, event.position().toPoint())
+                return True
+            if kind == QEvent.Type.MouseMove and self.mouse_channel == channel:
+                owner.mouse_control(channel, event.position().toPoint())
+                return True
+            if kind == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                self.mouse_channel = None
+                self.apply_joint(channel)
+                return True
+            if kind == QEvent.Type.Wheel:
+                return True
         if kind not in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
             return False
-        if kind == QEvent.Type.KeyRelease and event.key() in self.servo_keys:
-            if not event.isAutoRepeat():
-                channel, _ = self.servo_keys[event.key()]
-
-                slider = {
-                    2: self.owner.arm,
-                    1: self.owner.elbow,
-                    0: self.owner.pivot,
-                }[channel]
-
-                slider.setValue(90)
-
-            return True
-        if isinstance(self.owner.window.focusWidget(), QLineEdit):
-            return False  # Permit normal typing in the COM port entry.
+        if not isinstance(watched, QWidget) or (watched is not owner.window and
+                not owner.window.isAncestorOf(watched)):
+            return False
         key = event.key()
         pressed = kind == QEvent.Type.KeyPress
+        if key not in self.drive_keys and key not in self.servo_keys and key != Qt.Key.Key_Space:
+            return False
+        # Releases are processed even if a text box gained focus.
+        if pressed and (owner.closing or owner.connection_busy or
+                        isinstance(owner.window.focusWidget(), QLineEdit)):
+            return False
+        if event.isAutoRepeat():
+            return True  # QTimer controls movement, not the OS repeat rate.
         if key in self.drive_keys:
-            if event.isAutoRepeat():
-                return True
-            if pressed:
-                if key not in self.held:
-                    self.held.append(key)
-            elif key in self.held:
+            if pressed and key not in self.held:
+                self.held.append(key)
+            elif not pressed and key in self.held:
                 self.held.remove(key)
-            self.owner.set_keyboard_drive(self.drive_keys[self.held[-1]] if self.held else None)
-            return True
-        if key in self.servo_keys:
-            channel, sign = self.servo_keys[key]
-            if pressed:
-                self.owner.step_servo(channel, sign * SERVO_STEP)
-            return True 
-            
-        if key == Qt.Key.Key_Space:
-            if pressed and not event.isAutoRepeat():
-                self.owner.toggle_grip()
-            return True
+            owner.set_keyboard_drive(self.drive_keys[self.held[-1]] if self.held else None)
+        elif key in self.servo_keys:
+            if pressed and key not in self.joint_held:
+                self.joint_held.append(key)
+            elif not pressed and key in self.joint_held:
+                self.joint_held.remove(key)
+            self.apply_joint(self.servo_keys[key][0])
+        elif pressed:
+            owner.toggle_grip()
+        return True
 
-        elif not event.isAutoRepeat():
-            slider = {
-                2: self.owner.arm,
-                1: self.owner.elbow,
-                0: self.owner.pivot,
-            }[channel]
-
-            slider.setValue(90)
-
-            return True
-        return False
+    def apply_joint(self, channel):
+        if self.mouse_channel == channel:
+            return
+        keys = [key for key in self.joint_held if self.servo_keys[key][0] == channel]
+        sign = self.servo_keys[keys[-1]][1] if keys else 0
+        self.owner.sliders[channel].setValue(CONTROL_CENTER + sign * CONTROL_CENTER)
 
     def clear(self):
         self.held.clear()
+        self.joint_held.clear()
+        self.mouse_channel = None
+        for slider in self.owner.sliders.values():
+            slider.setValue(CONTROL_CENTER)
         self.owner.set_keyboard_drive(None)
 
 
@@ -255,7 +261,7 @@ class RobotUI(QObject):
         "reconnBtn": (797, 458, 54, 60),
         "bluetoothLabel": (410, 529, 180, 35),
         "connectionStatus": (410, 570, 441, 28),
-        "cameraStatus": (0, 0, 1, 1),
+        "cameraStatus": (312, 438, 620, 20),
         "gripStatus": (0, 0, 1, 1),
         "gripBtn": (982, 542, 103, 103),
         "armValue": (814, 713, 145, 34),
@@ -303,7 +309,6 @@ class RobotUI(QObject):
         self.elbow = self.get(QSlider, "elbowSlider")  # Servo 1
         self.pivot = self.get(QSlider, "turnSlider")  # Servo 0
         self.grip = self.get(QPushButton, "gripBtn")  # Servo 3 (toggle only)
-        self.turnSlider = self.get(QSlider, "turnSlider")
         self.port = self.get(QLineEdit, "portNameEdit")
         self.status = self.get(QLabel, "connectionStatus")
         self.reconnect_button = self.get(QPushButton, "reconnBtn")
@@ -326,13 +331,13 @@ class RobotUI(QObject):
             slider.setPageStep(SERVO_STEP)
             slider.setValue(90)
             slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.arm.valueChanged.connect(lambda v: self.on_servo(2, v))
-        self.elbow.valueChanged.connect(lambda v: self.on_servo(1, v))
-        self.pivot.valueChanged.connect(lambda v: self.on_servo(0, v))
-        for slider in (self.arm, self.elbow, self.pivot):
-            slider.sliderReleased.connect(
-                lambda s=slider: s.setValue(90)
-            )   
+        self.sliders = {0: self.pivot, 1: self.elbow, 2: self.arm}
+        # Sliders are direction controls. These are the retained target angles.
+        self.servo_angles = {0: 90.0, 1: 90.0, 2: 90.0}
+        self.servo_timer = QTimer(self)
+        self.servo_timer.setInterval(SERVO_INTERVAL_MS)
+        self.servo_timer.timeout.connect(self.advance_servos)
+        self.servo_timer.start()
         self.grip.clicked.connect(self.toggle_grip)
         self.reconnect_button.clicked.connect(self.toggle_connection)
         self.port.returnPressed.connect(self.connect)
@@ -368,22 +373,63 @@ class RobotUI(QObject):
         widget.update()
 
     def update_labels(self):
-        self.arm_label.setText(f"ARM: {self.arm.value()}°")
-        self.elbow_label.setText(f"ELBOW: {self.elbow.value()}°")
-        self.pivot_label.setText(f"PIVOT: {self.pivot.value()}°")
+        self.arm_label.setText(f"ARM: {round(self.servo_angles[2])}°")
+        self.elbow_label.setText(f"ELBOW: {round(self.servo_angles[1])}°")
+        self.pivot_label.setText(f"PIVOT: {round(self.servo_angles[0])}°")
         self.grip_label.setText("CLAW: OPEN" if self.grip_open else "CLAW: CLOSED")
         self.grip.setText("OPEN" if self.grip_open else "CLOSE")
         self.grip.setToolTip("Spacebar: toggle claw")
         self.style_state(self.grip, "gripState", "out" if self.grip_open else "in")
 
-    def step_servo(self, channel, amount):
-        slider = {2: self.arm, 1: self.elbow, 0: self.pivot}[channel]
-        slider.setValue(max(slider.minimum(), min(slider.maximum(), slider.value() + amount)))
+    def mouse_control(self, channel, point):
+        slider = self.sliders[channel]
+        option = QStyleOptionSlider()
+        option.initFrom(slider)
+        option.orientation = slider.orientation()
+        option.minimum = slider.minimum()
+        option.maximum = slider.maximum()
+        option.sliderPosition = slider.sliderPosition()
+        option.sliderValue = slider.value()
+        option.singleStep = slider.singleStep()
+        option.pageStep = slider.pageStep()
+        reversed_axis = (slider.orientation() == Qt.Orientation.Vertical or
+                         slider.layoutDirection() == Qt.LayoutDirection.RightToLeft)
+        option.upsideDown = slider.invertedAppearance() != reversed_axis
+        style = slider.style()
+        groove = style.subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                      QStyle.SubControl.SC_SliderGroove, slider)
+        handle = style.subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                      QStyle.SubControl.SC_SliderHandle, slider)
+        if slider.orientation() == Qt.Orientation.Horizontal:
+            start = groove.x()
+            span = groove.width() - handle.width()
+            position = point.x() - start - handle.width() // 2
+        else:
+            start = groove.y()
+            span = groove.height() - handle.height()
+            position = point.y() - start - handle.height() // 2
+        value = QStyle.sliderValueFromPosition(slider.minimum(), slider.maximum(),
+                    max(0, min(span, position)), max(1, span), option.upsideDown)
+        slider.setValue(value)
 
-    def on_servo(self, channel, value):
-        self.update_labels()
-        if self.connected and not self.connection_busy and not self.closing:
-            self.bluetooth.submit("servo", channel, value)
+    def advance_servos(self):
+        if not self.connected or self.connection_busy or self.closing:
+            return
+        # Fixed small increments avoid a large jump after any UI pause.
+        step = SERVO_DEGREES_PER_SECOND * SERVO_INTERVAL_MS / 1000.0
+        changed = False
+        for channel, slider in self.sliders.items():
+            offset = slider.value() - CONTROL_CENTER
+            if abs(offset) <= CONTROL_DEADZONE:
+                continue
+            previous = self.servo_angles[channel]
+            target = max(0.0, min(180.0, previous + (step if offset > 0 else -step)))
+            self.servo_angles[channel] = target
+            if round(target) != round(previous):
+                self.bluetooth.submit("servo", channel, round(target))
+                changed = True
+        if changed:
+            self.update_labels()
 
     def toggle_grip(self):
         self.grip_open = not self.grip_open
@@ -464,8 +510,8 @@ class RobotUI(QObject):
         self.mouse_drive = None
         self.key_filter.clear()
         self.update_connection_status("CONNECTING…")
-        angles = ((0, self.pivot.value()), (1, self.elbow.value()),
-                  (2, self.arm.value()), (3, GRIP_OPEN if self.grip_open else GRIP_CLOSED))
+        angles = tuple((c, round(self.servo_angles[c])) for c in (0, 1, 2)) + (
+            (3, GRIP_OPEN if self.grip_open else GRIP_CLOSED),)
         self.bluetooth.submit("connect", port, angles, self.motor_speed)
 
     def toggle_connection(self):
@@ -494,6 +540,7 @@ class RobotUI(QObject):
         self.stream.frame.connect(self._on_frame)
         self.stream.status.connect(self._on_camera_status)
         self.stream.start()
+        self.get(QPushButton, "refreshFeedBtn").clicked.connect(self.refresh_camera)
 
     @Slot(QImage)
     def _on_frame(self, image):
@@ -502,13 +549,20 @@ class RobotUI(QObject):
             self.feed_placeholder.size(), Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation))
 
-    @Slot(bool)
-    def _on_camera_status(self, connected):
-        self.camera_status.setText("CAMERA CONNECTED" if connected else "CAMERA UNAVAILABLE")
-        if not connected:
+    @Slot(str)
+    def _on_camera_status(self, message):
+        self.camera_status.setText(message)
+        self.camera_status.setToolTip(message)
+        if message != "CAMERA CONNECTED":
             self.last_frame = None
             self.feed_placeholder.setPixmap(QPixmap())
-            self.feed_placeholder.setText(self.placeholder_text)
+            self.feed_placeholder.setWordWrap(True)
+            self.feed_placeholder.setText(f"{message}\n{STREAM_URL}")
+
+    def refresh_camera(self):
+        if not self.closing:
+            self._on_camera_status("CAMERA RECONNECTING…")
+            self.stream.reconnect()
 
     def apply_speed(self):
         try:
@@ -542,6 +596,8 @@ class RobotUI(QObject):
         if self.closing:
             return
         self.closing = True
+        self.servo_timer.stop()
+        self.key_filter.clear()
         self.mouse_drive = None
         self.keyboard_drive = None
         self.update_connection_status("CLOSING…")
@@ -574,51 +630,73 @@ class RobotUI(QObject):
 
 
 class StreamThread(QThread):
-    """Reads an MJPEG stream and emits each JPEG frame as a QImage."""
+    """MJPEG reader with bounded buffers, visible errors and nonblocking retry."""
     frame = Signal(QImage)
-    status = Signal(bool)
+    status = Signal(str)
 
     def __init__(self, url, parent=None):
         super().__init__(parent)
         self.url = url
         self.running = True
+        self.retry = threading.Event()
 
     def run(self):
-        connected = False
         while self.running:
+            self.retry.clear()
+            self.status.emit("CAMERA CONNECTING…")
             try:
-                with urllib.request.urlopen(self.url, timeout=3) as response:
+                request = urllib.request.Request(self.url, headers={"User-Agent": "RobotCamera/1.0"})
+                with urllib.request.urlopen(request, timeout=3) as response:
                     buffer = b""
-                    while self.running:
-                        chunk = response.read(4096)
+                    connected = False
+                    last_frame_time = time.monotonic()
+                    last_emit = 0.0
+                    while self.running and not self.retry.is_set():
+                        chunk = response.read1(16384)
                         if not chunk:
-                            break
+                            raise OSError("Camera closed the stream")
                         buffer += chunk
-                        start = buffer.find(b"\xff\xd8")
-                        end = buffer.find(b"\xff\xd9", start + 2) if start != -1 else -1
-                        if start != -1 and end != -1:
-                            jpeg = buffer[start:end + 2]
-                            buffer = buffer[end + 2:]
+                        latest = None
+                        while True:
+                            start = buffer.find(b"\xff\xd8")
+                            if start < 0:
+                                buffer = buffer[-1:]  # Preserve a split JPEG marker.
+                                break
+                            if start:
+                                buffer = buffer[start:]
+                            end = buffer.find(b"\xff\xd9", 2)
+                            if end < 0:
+                                break
+                            jpeg, buffer = buffer[:end + 2], buffer[end + 2:]
                             image = QImage.fromData(jpeg, "JPG")
                             if not image.isNull():
-                                if not connected:
-                                    connected = True
-                                    self.status.emit(True)
-                                self.frame.emit(image)
-                        elif start == -1 and len(buffer) > 65536:
-                            buffer = b""  # Discard junk so the buffer can't grow forever.
-            except Exception:
-                pass
-            if connected:
-                connected = False
-                self.status.emit(False)
-            for _ in range(20):  # Wait ~2 s before retrying, but stay stoppable.
-                if not self.running:
-                    return
-                self.msleep(100)
+                                latest = image
+                                last_frame_time = time.monotonic()
+                        if len(buffer) > 4 * 1024 * 1024:
+                            raise OSError("Invalid or oversized camera frame")
+                        if time.monotonic() - last_frame_time > 5:
+                            raise OSError("No JPEG frames received; check the stream URL")
+                        if latest is not None:
+                            if not connected:
+                                connected = True
+                                self.status.emit("CAMERA CONNECTED")
+                            now = time.monotonic()
+                            if now - last_emit >= 1 / 30:
+                                self.frame.emit(latest)
+                                last_emit = now
+            except Exception as exc:
+                if self.running and not self.retry.is_set():
+                    self.status.emit(f"CAMERA UNAVAILABLE: {exc}")
+            if self.running:
+                self.retry.wait(2)
+
+    def reconnect(self):
+        # Current network read times out within ~3 s; never wait on the GUI.
+        self.retry.set()
 
     def stop(self):
         self.running = False
+        self.retry.set()
 
 
 
