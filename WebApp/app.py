@@ -11,6 +11,7 @@ from PySide6.QtCore import QEvent, QFile, QIODevice, QObject, Qt, QUrl, Signal, 
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton, QSlider, QStackedLayout, QWidget, QSizePolicy
 from PySide6.QtGui import QImage, QPixmap, QIntValidator, QRegularExpressionValidator
+from zope import event
 
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -163,7 +164,7 @@ class KeyFilter(QObject):
                 self.owner.shutdown()
                 return True
         if watched is self.owner.window and event.type() == QEvent.Type.Resize:
-            self.owner.controller.resize_layout()
+            self.owner.resize_layout()
             return False
         if self.owner.closing or self.owner.connection_busy:
             return False
@@ -176,6 +177,19 @@ class KeyFilter(QObject):
             return False
         if kind not in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
             return False
+        if kind == QEvent.Type.KeyRelease and event.key() in self.servo_keys:
+            if not event.isAutoRepeat():
+                channel, _ = self.servo_keys[event.key()]
+
+                slider = {
+                    2: self.owner.arm,
+                    1: self.owner.elbow,
+                    0: self.owner.pivot,
+                }[channel]
+
+                slider.setValue(90)
+
+            return True
         if isinstance(self.owner.window.focusWidget(), QLineEdit):
             return False  # Permit normal typing in the COM port entry.
         key = event.key()
@@ -191,13 +205,25 @@ class KeyFilter(QObject):
             self.owner.set_keyboard_drive(self.drive_keys[self.held[-1]] if self.held else None)
             return True
         if key in self.servo_keys:
+            channel, sign = self.servo_keys[key]
             if pressed:
-                channel, sign = self.servo_keys[key]
                 self.owner.step_servo(channel, sign * SERVO_STEP)
-            return True
+            return True 
+            
         if key == Qt.Key.Key_Space:
             if pressed and not event.isAutoRepeat():
                 self.owner.toggle_grip()
+            return True
+
+        elif not event.isAutoRepeat():
+            slider = {
+                2: self.owner.arm,
+                1: self.owner.elbow,
+                0: self.owner.pivot,
+            }[channel]
+
+            slider.setValue(90)
+
             return True
         return False
 
@@ -277,6 +303,7 @@ class RobotUI(QObject):
         self.elbow = self.get(QSlider, "elbowSlider")  # Servo 1
         self.pivot = self.get(QSlider, "turnSlider")  # Servo 0
         self.grip = self.get(QPushButton, "gripBtn")  # Servo 3 (toggle only)
+        self.turnSlider = self.get(QSlider, "turnSlider")
         self.port = self.get(QLineEdit, "portNameEdit")
         self.status = self.get(QLabel, "connectionStatus")
         self.reconnect_button = self.get(QPushButton, "reconnBtn")
@@ -302,6 +329,10 @@ class RobotUI(QObject):
         self.arm.valueChanged.connect(lambda v: self.on_servo(2, v))
         self.elbow.valueChanged.connect(lambda v: self.on_servo(1, v))
         self.pivot.valueChanged.connect(lambda v: self.on_servo(0, v))
+        for slider in (self.arm, self.elbow, self.pivot):
+            slider.sliderReleased.connect(
+                lambda s=slider: s.setValue(90)
+            )   
         self.grip.clicked.connect(self.toggle_grip)
         self.reconnect_button.clicked.connect(self.toggle_connection)
         self.port.returnPressed.connect(self.connect)
@@ -374,9 +405,6 @@ class RobotUI(QObject):
             self.update_drive()
 
     def update_drive(self):
-        self.turn_slider.sliderReleased.connect(
-        lambda: self.turn_slider.setValue(NEUTRAL)
-        )
         direction = self.mouse_drive or self.keyboard_drive
         self.forward.position = NEUTRAL
         self.turn.position = NEUTRAL
@@ -502,7 +530,7 @@ class RobotUI(QObject):
         scale_y = self.window.height() / self.reference_height
 
         for name, (x, y, width, height) in self.reference_geometries.items():
-            widget = self.require_widget(QWidget, name)
+            widget = self.get(QWidget, name)
             widget.setGeometry(
                 round(x * scale_x),
                 round(y * scale_y),
