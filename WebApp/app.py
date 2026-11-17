@@ -7,10 +7,10 @@ import sys
 from pathlib import Path
 import urllib.request
 
-from PySide6.QtCore import QEvent, QFile, QIODevice, QObject, Qt, QUrl, Signal, QThread, QTimer
+from PySide6.QtCore import QEvent, QFile, QIODevice, QObject, Qt, QUrl, Signal, Slot, QThread, QTimer, QRunnable, QThreadPool, QRegularExpression
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton, QSlider, QStackedLayout, QWidget, QSizePolicy
-from PySide6.QtGui import QImage, QPixmap, QIntValidator
+from PySide6.QtGui import QImage, QPixmap, QIntValidator, QRegularExpressionValidator
 
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -36,6 +36,112 @@ class MotorValue:
         return self.position
 
 
+class CommandSignals(QObject):
+    finished = Signal(object)
+
+
+class BluetoothCommand(QRunnable):
+    """One blocking hardware operation. Arguments contain only plain values."""
+    def __init__(self, board, action, args):
+        super().__init__()
+        self.board, self.action, self.args = board, action, args
+        self.signals = CommandSignals()
+
+    @Slot()
+    def run(self):
+        board = self.board
+        error = ""
+        try:
+            if self.action == "connect":
+                port, angles, speed = self.args
+                if not board.reconn(port):
+                    raise RuntimeError(board.last_error or "Bluetooth connection failed")
+                board.stop_motors()
+                board.set_motor_speed(speed)
+                for channel, angle in angles:
+                    board.set_servo_angle(channel, angle)
+            elif self.action == "disconnect":
+                try:
+                    if board.connected:
+                        board.stop_motors()
+                finally:
+                    board.close()
+            elif self.action == "speed":
+                board.set_motor_speed(self.args[0])
+            elif board.connected:
+                if self.action == "servo":
+                    board.set_servo_angle(*self.args)
+                elif self.action == "motor":
+                    forward, turn = self.args
+                    board.update_motors(MotorValue(forward), MotorValue(turn))
+            if self.action in ("connect", "servo", "motor") and not board.connected:
+                raise RuntimeError(board.last_error or "Bluetooth disconnected")
+        except Exception as exc:
+            error = str(exc)
+            try:
+                board.close()
+            except Exception as close_error:
+                error += f"; close failed: {close_error}"
+        self.signals.finished.emit({
+            "action": self.action,
+            "connected": bool(board.connected) and not error,
+            "port": board.com_port,
+            "error": error or board.last_error or "",
+        })
+
+
+class BluetoothPool(QObject):
+    """Serialize board access and keep the command queue small."""
+    state_changed = Signal(object)
+
+    def __init__(self, board, parent):
+        super().__init__(parent)
+        self.board = board
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(1)
+        self.pool.setExpiryTimeout(-1)
+        self.pending = []
+        self.active = None
+
+    def submit(self, action, *args):
+        key = (action, args[0]) if action == "servo" else (action,)
+        if action in ("connect", "disconnect"):
+            self.pending.clear()
+        else:
+            # Keep a pending stop before a later press.
+            self.pending = [
+                item for item in self.pending
+                if item[0] != key or (item[1] == "motor" and item[2] == (NEUTRAL, NEUTRAL))
+            ]
+        entry = (key, action, args)
+        if action == "motor" and args == (NEUTRAL, NEUTRAL):
+            self.pending = [item for item in self.pending if item[1] != "motor"]
+            self.pending.insert(0, entry)
+        else:
+            self.pending.append(entry)
+        self.start_next()
+
+    def start_next(self):
+        if self.active is not None or not self.pending:
+            return
+        _, action, args = self.pending.pop(0)
+        self.active = BluetoothCommand(self.board, action, args)
+        self.active.signals.finished.connect(self.completed, Qt.ConnectionType.QueuedConnection)
+        self.pool.start(self.active)
+
+    @Slot(object)
+    def completed(self, result):
+        self.active = None
+        if result["error"] and not result["connected"]:
+            # Retain an explicit lifecycle operation such as shutdown or retry.
+            self.pending = [item for item in self.pending if item[1] in ("connect", "disconnect")]
+        self.state_changed.emit(result)
+        self.start_next()
+
+    def idle(self):
+        return self.active is None and not self.pending and self.pool.activeThreadCount() == 0
+
+
 class KeyFilter(QObject):
     drive_keys = {Qt.Key.Key_W: "upBtn", Qt.Key.Key_S: "downBtn",
                   Qt.Key.Key_A: "leftBtn", Qt.Key.Key_D: "rightBtn"}
@@ -51,6 +157,16 @@ class KeyFilter(QObject):
         self.held = []
 
     def eventFilter(self, watched, event):
+        if watched is self.owner.window and event.type() == QEvent.Type.Close:
+            if not self.owner.close_ready:
+                event.ignore()
+                self.owner.shutdown()
+                return True
+        if watched is self.owner.window and event.type() == QEvent.Type.Resize:
+            self.owner.controller.resize_layout()
+            return False
+        if self.owner.closing or self.owner.connection_busy:
+            return False
         if not isinstance(watched, QWidget) or (watched is not self.owner.window and
                 not self.owner.window.isAncestorOf(watched)):
             return False
@@ -90,10 +206,47 @@ class KeyFilter(QObject):
         self.owner.set_keyboard_drive(None)
 
 
-class RobotUI:
+class RobotUI(QObject):
+    reference_width = 1366
+    reference_height = 768
+    reference_geometries = {
+        "Feed": (312, 113, 620, 260),
+        "feedTitle": (312, 68, 620, 36),
+        "refreshFeedBtn": (547, 390, 150, 42),
+        "armTitle": (960, 96, 80, 40),
+        "elbowTitle": (1035, 96, 105, 40),
+        "armSlider": (972, 145, 54, 280),
+        "elbowSlider": (1055, 145, 54, 280),
+        "turnTitle": (905, 425, 275, 28),
+        "turnSlider": (910, 450, 270, 64),
+        "upBtn": (132, 502, 56, 56),
+        "leftBtn": (50, 574, 56, 56),
+        "rightBtn": (214, 574, 56, 56),
+        "downBtn": (132, 646, 56, 56),
+        "wheelSpeedTitle": (290, 640, 197, 28),
+        "wheelSpeedInput": (410, 640, 72, 28),
+        "portNameEdit": (410, 460, 360, 56),
+        "reconnBtn": (797, 458, 54, 60),
+        "bluetoothLabel": (410, 529, 180, 35),
+        "connectionStatus": (410, 570, 441, 28),
+        "cameraStatus": (0, 0, 1, 1),
+        "gripStatus": (0, 0, 1, 1),
+        "gripBtn": (982, 542, 103, 103),
+        "armValue": (814, 713, 145, 34),
+        "elbowValue": (972, 713, 160, 34),
+        "turnStatus": (1158, 713, 145, 34),
+        }
     def __init__(self, app, board):
+        super().__init__(app)
         self.application = app
-        self.board = board  # Exactly one instance of MyTelemetrix.
+        self.connected = bool(board.connected)
+        self.connected_port = board.com_port
+        self.last_error = board.last_error
+        self.motor_speed = board.motor_speed
+        self.connection_busy = False
+        self.close_ready = False
+        self.bluetooth = BluetoothPool(board, self)
+        self.bluetooth.state_changed.connect(self.on_hardware_result)
         self.forward = MotorValue()
         self.turn = MotorValue()
         self.keyboard_drive = None
@@ -154,7 +307,7 @@ class RobotUI:
         self.port.returnPressed.connect(self.connect)
         self.wheel_speed = self.get(QLineEdit, "wheelSpeedInput")
         self.wheel_speed.setValidator(QIntValidator(0, 255, self.wheel_speed))
-        self.wheel_speed.setText(str(self.board.motor_speed))
+        self.wheel_speed.setText(str(self.motor_speed))
         self.wheel_speed.setPlaceholderText("0-255")
         self.wheel_speed.editingFinished.connect(self.apply_speed)
         self.wheel_speed.returnPressed.connect(self.wheel_speed.clearFocus)
@@ -165,7 +318,6 @@ class RobotUI:
             button.released.connect(lambda n=name: self.release_mouse_drive(n))
         self.key_filter = KeyFilter(self)
         app.installEventFilter(self.key_filter)
-        self.window.installEventFilter(self.key_filter)
         self.window.setStyleSheet((base / "theme.qss").read_text(encoding="utf-8"))
         self._init_camera()
         self.update_labels()
@@ -199,20 +351,14 @@ class RobotUI:
 
     def on_servo(self, channel, value):
         self.update_labels()
-        if self.board.connected:
-            try:
-                self.board.set_servo_angle(channel, value)
-            except Exception as error:
-                self.hardware_error(error)
+        if self.connected and not self.connection_busy and not self.closing:
+            self.bluetooth.submit("servo", channel, value)
 
     def toggle_grip(self):
         self.grip_open = not self.grip_open
         self.update_labels()
-        if self.board.connected:
-            try:
-                self.board.set_servo_angle(3, GRIP_OPEN if self.grip_open else GRIP_CLOSED)
-            except Exception as error:
-                self.hardware_error(error)
+        if self.connected and not self.connection_busy and not self.closing:
+            self.bluetooth.submit("servo", 3, GRIP_OPEN if self.grip_open else GRIP_CLOSED)
 
     def set_keyboard_drive(self, direction):
         self.keyboard_drive = direction
@@ -228,7 +374,9 @@ class RobotUI:
             self.update_drive()
 
     def update_drive(self):
-        
+        self.turn_slider.sliderReleased.connect(
+        lambda: self.turn_slider.setValue(NEUTRAL)
+        )
         direction = self.mouse_drive or self.keyboard_drive
         self.forward.position = NEUTRAL
         self.turn.position = NEUTRAL
@@ -242,61 +390,67 @@ class RobotUI:
             self.turn.position = 0
         for name in ("upBtn", "downBtn", "leftBtn", "rightBtn"):
             self.style_state(self.get(QPushButton, name), "active", "true" if name == direction else "false")
-        if self.board.connected:
-            try:
-                self.board.update_motors(self.forward, self.turn)
-            except Exception as error:
-                self.hardware_error(error)
+        if self.connected and not self.connection_busy and not self.closing:
+            self.bluetooth.submit("motor", self.forward.position, self.turn.position)
 
     def update_connection_status(self, message=None):
-        connected = self.board.connected
+        connected = self.connected
         self.status.setText(message if message is not None else (
-            f"CONNECTED: {self.board.com_port}" if connected else
-            (f"DISCONNECTED: {self.board.last_error}" if self.board.last_error else "DISCONNECTED — enter port and press ↻")
+            f"CONNECTED: {self.connected_port}" if connected else
+            (f"DISCONNECTED: {self.last_error}" if self.last_error else "DISCONNECTED — enter port and press ↻")
         ))
         self.status.setToolTip(self.status.text())
         self.style_state(self.status, "connected", "true" if connected else "false")
         self.style_state(self.reconnect_button, "connected", "true" if connected else "false")
         self.reconnect_button.setText("×" if connected else "↻")
         self.reconnect_button.setToolTip("Disconnect" if connected else "Connect / retry")
+        enabled = not self.connection_busy and not self.closing
+        self.reconnect_button.setEnabled(enabled)
+        self.port.setEnabled(enabled)
+        self.wheel_speed.setEnabled(enabled)
+        for name in ("upBtn", "downBtn", "leftBtn", "rightBtn", "gripBtn",
+                     "armSlider", "elbowSlider", "turnSlider"):
+            self.get(QWidget, name).setEnabled(enabled)
+
+    @Slot(object)
+    def on_hardware_result(self, result):
+        self.connected = result["connected"]
+        self.connected_port = result["port"]
+        self.last_error = result["error"]
+        if result["action"] in ("connect", "disconnect"):
+            self.connection_busy = False
+        if not self.connected:
+            self.mouse_drive = None
+            self.key_filter.clear()
+        if not self.closing and not self.connection_busy:
+            self.update_connection_status()
 
     def connect(self):
+        if self.closing or self.connection_busy or self.connected:
+            return
         port = self.port.text().strip()
         if not port:
             self.update_connection_status("ENTER A BLUETOOTH COM PORT")
             return
-        self.key_filter.clear()
+        self.connection_busy = True
         self.mouse_drive = None
+        self.key_filter.clear()
         self.update_connection_status("CONNECTING…")
-        QApplication.processEvents()
-        if not self.board.reconn(port):
-            self.update_connection_status()
-            return
-        try:
-            # Restore all four servos when the board is reconnected.
-            for channel, angle in ((0, self.pivot.value()), (1, self.elbow.value()),
-                                   (2, self.arm.value()), (3, GRIP_OPEN if self.grip_open else GRIP_CLOSED)):
-                self.board.set_servo_angle(channel, angle)
-            self.board.stop_motors()
-        except Exception as error:
-            self.hardware_error(error)
-            return
-        self.update_connection_status()
+        angles = ((0, self.pivot.value()), (1, self.elbow.value()),
+                  (2, self.arm.value()), (3, GRIP_OPEN if self.grip_open else GRIP_CLOSED))
+        self.bluetooth.submit("connect", port, angles, self.motor_speed)
 
     def toggle_connection(self):
-        if self.board.connected:
-            self.key_filter.clear()
+        if self.closing or self.connection_busy:
+            return
+        if self.connected:
+            self.connection_busy = True
             self.mouse_drive = None
-            self.board.close()
-            self.update_connection_status()
-            self.update_drive()
+            self.key_filter.clear()
+            self.update_connection_status("DISCONNECTING…")
+            self.bluetooth.submit("disconnect")
         else:
             self.connect()
-
-    def hardware_error(self, error):
-        self.board.last_error = str(error)
-        self.board.close()
-        self.update_connection_status()
 
     def _init_camera(self):
         holder = QStackedLayout(self.feed)
@@ -313,12 +467,14 @@ class RobotUI:
         self.stream.status.connect(self._on_camera_status)
         self.stream.start()
 
+    @Slot(QImage)
     def _on_frame(self, image):
         self.last_frame = image
         self.feed_placeholder.setPixmap(QPixmap.fromImage(image).scaled(
             self.feed_placeholder.size(), Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation))
 
+    @Slot(bool)
     def _on_camera_status(self, connected):
         self.camera_status.setText("CAMERA CONNECTED" if connected else "CAMERA UNAVAILABLE")
         if not connected:
@@ -330,23 +486,64 @@ class RobotUI:
         try:
             value = int(self.wheel_speed.text().strip())
         except ValueError:
-            value = self.board.motor_speed  # Empty or invalid: keep the old speed.
+            value = self.motor_speed  # Empty or invalid: keep the old speed.
         value = max(0, min(255, value))
         self.wheel_speed.setText(str(value))
-        self.board.set_motor_speed(value)
+        self.motor_speed = value
+        if not self.closing and not self.connection_busy:
+            self.bluetooth.submit("speed", value)
         self.update_drive()  # Re-send so a speed change applies while driving.
 
     def show(self):
         self.window.show()
 
+    def resize_layout(self):
+        scale_x = self.window.width() / self.reference_width
+        scale_y = self.window.height() / self.reference_height
+
+        for name, (x, y, width, height) in self.reference_geometries.items():
+            widget = self.require_widget(QWidget, name)
+            widget.setGeometry(
+                round(x * scale_x),
+                round(y * scale_y),
+                max(1, round(width * scale_x)),
+                max(1, round(height * scale_y)),
+            )
+
     def shutdown(self):
         if self.closing:
             return
         self.closing = True
-        self.application.removeEventFilter(self.key_filter)
-        self.window.removeEventFilter(self.key_filter)
+        self.mouse_drive = None
+        self.keyboard_drive = None
+        self.update_connection_status("CLOSING…")
         self.stream.stop()
-        self.board.close()
+        self.bluetooth.submit("disconnect")
+        self.close_timer = QTimer(self)
+        self.close_timer.timeout.connect(self.finish_shutdown)
+        self.close_timer.start(25)
+
+    def finish_shutdown(self):
+        if not self.bluetooth.idle() or self.stream.isRunning():
+            return
+        self.close_timer.stop()
+        self.close_ready = True
+        self.application.removeEventFilter(self.key_filter)
+        self.window.close()
+
+    def wait_for_shutdown(self):
+        # Fallback for an external app.quit() after the event loop has stopped.
+        if self.close_ready:
+            return
+        self.shutdown()
+        self.bluetooth.pool.waitForDone()
+        # The GUI completion slot may be queued when app.quit() stops the loop.
+        self.bluetooth.pending.clear()
+        self.bluetooth.active = None
+        self.bluetooth.submit("disconnect")
+        self.bluetooth.pool.waitForDone()
+        self.stream.wait()
+
 
 class StreamThread(QThread):
     """Reads an MJPEG stream and emits each JPEG frame as a QImage."""
@@ -362,7 +559,7 @@ class StreamThread(QThread):
         connected = False
         while self.running:
             try:
-                with urllib.request.urlopen(self.url, timeout=15) as response:
+                with urllib.request.urlopen(self.url, timeout=3) as response:
                     buffer = b""
                     while self.running:
                         chunk = response.read(4096)
@@ -394,7 +591,6 @@ class StreamThread(QThread):
 
     def stop(self):
         self.running = False
-        self.wait(6000)
 
 
 
@@ -402,7 +598,7 @@ def main():
     application = QApplication(sys.argv)
     board = MyTelemetrix()  # Offline at startup; user explicitly connects in UI.
     ui = RobotUI(application, board)
-    application.aboutToQuit.connect(ui.shutdown)
+    application.aboutToQuit.connect(ui.wait_for_shutdown)
     ui.show()
     return application.exec()
 
